@@ -265,6 +265,7 @@ export class VideoRTC extends HTMLElement {
                 networkState: this.video.networkState,
                 currentTime: this.video.currentTime
             });
+
             if (this.ws) this.ws.close(); // run reconnect for broken MSE stream
         });
 
