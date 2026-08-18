@@ -35,6 +35,10 @@ type RTP struct {
 	// receiver is the backchannel track (caller to camera)
 	receiver *core.Receiver
 
+	// backPackets counts caller→camera RTP packets delivered to the persistent
+	// backchannel owner, for diagnosing whether backchannel audio is arriving.
+	backPackets int
+
 	// route, when set, is a persistent backchannel target owned by preload.
 	// Caller RTP is written straight into it, so a new backchannel sender is
 	// never spawned per call and nothing is attached/unlinked on teardown.
@@ -138,6 +142,15 @@ func (r *RTP) RouteTo(dst *core.Receiver) {
 	r.mu.Lock()
 	r.route = dst
 	r.mu.Unlock()
+}
+
+// BackPackets returns the number of caller→camera RTP packets routed into the
+// persistent backchannel owner during this session (diagnostic: 0 usually means
+// the caller isn't sending backchannel audio).
+func (r *RTP) BackPackets() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.backPackets
 }
 
 // audioCodecs returns the SIP-compatible audio codecs with standard payload types.
@@ -343,6 +356,11 @@ func (r *RTP) readLoop() {
 				Payload: pkt.Payload,
 			}
 			dst.Input(packet)
+			if route != nil {
+				r.mu.Lock()
+				r.backPackets++
+				r.mu.Unlock()
+			}
 		}
 	}
 }

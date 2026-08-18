@@ -212,6 +212,8 @@ func (c *consumer) cleanupLoop() {
 				log.Info().Str("call_id", id).Int("port", c.cfg.Port).Msg("[sip] reaping silent session")
 				if s.stream != nil && s.rtp != nil {
 					s.stream.RemoveConsumer(s.rtp)
+					log.Info().Int("back_packets", s.rtp.BackPackets()).
+						Str("call_id", id).Msg("[sip] backchannel summary")
 				}
 				delete(c.sessions, id)
 			}
@@ -614,6 +616,8 @@ func (c *consumer) onBye(conn *net.UDPConn, ra *net.UDPAddr, msg string) {
 		log.Info().Str("call_id", callID).Msg("[sip] BYE")
 		if s.stream != nil && s.rtp != nil {
 			s.stream.RemoveConsumer(s.rtp)
+			log.Info().Int("back_packets", s.rtp.BackPackets()).
+				Str("call_id", callID).Msg("[sip] backchannel summary")
 		}
 		conn.WriteToUDP([]byte(mkResponse(msg, callID, s.tag, "", "", 0, 0)), ra)
 	} else {
@@ -632,9 +636,11 @@ func (c *consumer) onCancel(conn *net.UDPConn, ra *net.UDPAddr, msg string) {
 	if ok {
 		log := app.GetLogger("sip")
 		log.Info().Str("call_id", callID).Msg("[sip] CANCEL")
-		if s.stream != nil && s.rtp != nil {
-			s.stream.RemoveConsumer(s.rtp)
-		}
+			if s.stream != nil && s.rtp != nil {
+				s.stream.RemoveConsumer(s.rtp)
+				log.Info().Int("back_packets", s.rtp.BackPackets()).
+					Str("call_id", callID).Msg("[sip] backchannel summary")
+			}
 		conn.WriteToUDP([]byte(mkResponse(msg, callID, s.tag, "", "", 0, 0)), ra)
 	} else {
 		conn.WriteToUDP([]byte(mkResponse(msg, callID, randHex(4), "", "", 0, 0)), ra)
