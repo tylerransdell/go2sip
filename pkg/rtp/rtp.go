@@ -35,6 +35,11 @@ type RTP struct {
 	// receiver is the backchannel track (caller to camera)
 	receiver *core.Receiver
 
+	// route, when set, is a persistent backchannel target owned by preload.
+	// Caller RTP is written straight into it, so a new backchannel sender is
+	// never spawned per call and nothing is attached/unlinked on teardown.
+	route *core.Receiver
+
 	// payloadType is set from the codec passed to AddTrack / GetTrack
 	payloadType byte
 
@@ -122,6 +127,16 @@ func (r *RTP) GetMedias() []*core.Media {
 func (r *RTP) DisablePoolRecvonly() {
 	r.mu.Lock()
 	r.noPoolRecvonly = true
+	r.mu.Unlock()
+}
+
+// RouteTo sets a persistent backchannel target. Incoming caller→camera RTP is
+// written directly into dst (an owner-preloaded backchannel track) instead of a
+// per-call receiver, so a new backchannel sender is never created per call and
+// no attach/unlink happens on teardown.
+func (r *RTP) RouteTo(dst *core.Receiver) {
+	r.mu.Lock()
+	r.route = dst
 	r.mu.Unlock()
 }
 
@@ -312,14 +327,22 @@ func (r *RTP) readLoop() {
 
 		r.mu.Lock()
 		receiver := r.receiver
+		route := r.route
 		r.mu.Unlock()
 
-		if receiver != nil {
+		// If a persistent backchannel owner is routed, write caller audio into
+		// it directly (no per-call receiver/sender created); otherwise use the
+		// per-endpoint receiver as before.
+		dst := receiver
+		if route != nil {
+			dst = route
+		}
+		if dst != nil {
 			packet := &core.Packet{
 				Header:  pkt.Header,
 				Payload: pkt.Payload,
 			}
-			receiver.Input(packet)
+			dst.Input(packet)
 		}
 	}
 }
