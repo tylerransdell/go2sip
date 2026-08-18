@@ -26,6 +26,12 @@ type RTP struct {
 	localConn  *net.UDPConn
 	rtcpConn   *net.UDPConn
 
+	// when true (SIP two-way), the backchannel (recvonly) media is not advertised
+	// in GetMedias, so the stream matcher never pairs a backchannel sender onto a
+	// watch conn. Backchannel is instead driven explicitly into a dedicated rtsp
+	// connection via BackchannelReceiver().
+	noPoolRecvonly bool
+
 	// receiver is the backchannel track (caller to camera)
 	receiver *core.Receiver
 
@@ -85,20 +91,38 @@ func NewRTP(remote string, localPort int) (*RTP, error) {
 }
 
 // GetMedias returns media descriptions for the stream matcher.
-// Audio: two medias sendonly (caller receives) + recvonly (caller sends).
+// Audio: sendonly (caller receives). If the pool backchannel is enabled, also
+// recvonly (caller sends back) is advertised so the matcher can pair it.
 func (r *RTP) GetMedias() []*core.Media {
-	return []*core.Media{
+	r.mu.Lock()
+	noRecv := r.noPoolRecvonly
+	r.mu.Unlock()
+
+	medias := []*core.Media{
 		{
 			Kind:      core.KindAudio,
 			Direction: core.DirectionSendonly,
 			Codecs:    audioCodecs(),
 		},
-		{
+	}
+	if !noRecv {
+		medias = append(medias, &core.Media{
 			Kind:      core.KindAudio,
 			Direction: core.DirectionRecvonly,
 			Codecs:    audioCodecs(),
-		},
+		})
 	}
+	return medias
+}
+
+// DisablePoolRecvonly stops the endpoint from advertising its backchannel
+// (recvonly) media to the stream matcher. Used by the SIP module so a caller→
+// camera backchannel is never paired onto a watch conn (which can't send);
+// instead it is driven explicitly via BackchannelReceiver().
+func (r *RTP) DisablePoolRecvonly() {
+	r.mu.Lock()
+	r.noPoolRecvonly = true
+	r.mu.Unlock()
 }
 
 // audioCodecs returns the SIP-compatible audio codecs with standard payload types.

@@ -101,8 +101,10 @@ type consumer struct {
 	back   *backchannel
 }
 
-// backchannel is a dedicated rtsp connection opened in ONVIF backchannel mode
-// (Backchannel=true → active producer). It is the actual send path to the camera.
+// backchannel is a dedicated rtsp connection used as the send path to the
+// camera: caller→camera audio is pushed over its advertised sendonly media via
+// AddTrack/Start. It is described WITHOUT the ONVIF backchannel Require (many
+// cameras reject it), but the sendonly backchannel media it advertises is kept.
 type backchannel struct {
 	conn  *rtsp.Conn
 	media *core.Media
@@ -296,7 +298,11 @@ func (c *consumer) ensureBackchannel(stream *streams.Stream, recvonlyCodecs []*c
 	}
 
 	conn := rtsp.NewClient(url)
-	conn.Backchannel = true
+	// Do NOT set Backchannel=true: that adds `Require: onvif backchannel` to
+	// DESCRIBE which many cameras reject ("wrong response on DESCRIBE"). The
+	// camera still advertises its sendonly backchannel m-line in a plain DESCRIBE;
+	// we keep that media here and use AddTrack + Start for the actual send path.
+	conn.Backchannel = false
 
 	log := app.GetLogger("sip")
 	if err := conn.Dial(); err != nil {
@@ -332,10 +338,6 @@ func (c *consumer) ensureBackchannel(stream *streams.Stream, recvonlyCodecs []*c
 		_ = conn.Close()
 		return nil
 	}
-
-	// Keep the send session alive. With no receivers, Handle() blocks reading
-	// (keepalive) while the conn stays in PLAY — the persistent backchannel.
-	go conn.Start()
 
 	c.back = &backchannel{conn: conn, media: media, codec: codec}
 	return c.back
@@ -537,6 +539,10 @@ func (c *consumer) onInvite(conn *net.UDPConn, ra *net.UDPAddr, msg string) {
 		log.Error().Err(err).Msg("[sip] RTP create failed")
 		return
 	}
+	// Backchannel for SIP two-way is driven explicitly into a dedicated rtsp
+	// conn, so don't let the stream matcher pair (and strand) a backchannel
+	// sender onto the main watch conn.
+	rtpEp.DisablePoolRecvonly()
 
 	// Register session BEFORE adding to stream so OnActivity is wired up
 	// immediately and no race with the cleanup loop.
@@ -574,12 +580,15 @@ func (c *consumer) onInvite(conn *net.UDPConn, ra *net.UDPAddr, msg string) {
 		}
 	}
 
-	// Drive the caller→camera backchannel into the persistent rtsp connection.
+	// Drive the caller→camera backchannel into the dedicated rtsp connection and
+	// start the send session (SETUP/PLAY). The conn is reused across calls; the
+	// previous call's channel is released by Reconnect on the next AddTrack.
 	if back != nil && direction != core.DirectionRecvonly {
 		rx := rtpEp.BackchannelReceiver(back.media, back.codec)
 		if err := back.conn.AddTrack(back.media, back.codec, rx); err != nil {
 			log.Warn().Err(err).Str("call_id", callID).Msg("[sip] backchannel attach failed")
 		} else {
+			go back.conn.Start()
 			log.Info().Str("call_id", callID).Msg("[sip] backchannel attached")
 		}
 	}
