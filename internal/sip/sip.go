@@ -562,10 +562,14 @@ func (c *consumer) onInvite(conn *net.UDPConn, ra *net.UDPAddr, msg string) {
 		log.Error().Err(err).Msg("[sip] RTP create failed")
 		return
 	}
-	// Backchannel for SIP two-way is driven explicitly into a dedicated rtsp
-	// conn, so don't let the stream matcher pair (and strand) a backchannel
-	// sender onto the main watch conn.
-	rtpEp.DisablePoolRecvonly()
+	// For rtsp targets we drive the backchannel into a dedicated conn, so keep the
+	// pool matcher from pairing (and stranding) a backchannel sender onto the main
+	// watch conn. For non-rtsp backends (tapo, etc.) there is no dedicated conn
+	// (back == nil), so leave the pool backchannel enabled — the native pairing
+	// works there and untouched.
+	if back != nil {
+		rtpEp.DisablePoolRecvonly()
+	}
 
 	// Register session BEFORE adding to stream so OnActivity is wired up
 	// immediately and no race with the cleanup loop.
