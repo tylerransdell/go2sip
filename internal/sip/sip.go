@@ -13,6 +13,7 @@ import (
 	"github.com/AlexxIT/go2rtc/internal/streams"
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/AlexxIT/go2rtc/pkg/rtp"
+	"github.com/AlexxIT/go2rtc/pkg/rtsp"
 	"github.com/pion/sdp/v3"
 )
 
@@ -91,6 +92,21 @@ type consumer struct {
 	hostIP     string
 	sessions   map[string]*session
 	sessionsMu sync.Mutex
+
+	// Persistent rtsp backchannel connection, dialed once and kept alive so each
+	// SIP call can attach/detach its (caller→camera) receiver to it without
+	// re-dialing or tearing the camera's channel. The watch conn used for main
+	// audio cannot transmit RTP to the camera, so backchannel needs its own.
+	backMu sync.Mutex
+	back   *backchannel
+}
+
+// backchannel is a dedicated rtsp connection opened in ONVIF backchannel mode
+// (Backchannel=true → active producer). It is the actual send path to the camera.
+type backchannel struct {
+	conn  *rtsp.Conn
+	media *core.Media
+	codec *core.Codec
 }
 
 type session struct {
@@ -218,6 +234,95 @@ func (c *consumer) updateActivityForIP(ip string) {
 	}
 }
 
+// ensureBackchannel lazily opens and keeps alive the dedicated rtsp backchannel
+// connection to the camera. The watch conn used for main audio cannot push RTP
+// out to the camera, so the caller→camera path must live on this separate
+// active-producer connection, held across calls (persistent / low-latency).
+func (c *consumer) ensureBackchannel(stream *streams.Stream) *backchannel {
+	c.backMu.Lock()
+	defer c.backMu.Unlock()
+	if c.back != nil {
+		return c.back
+	}
+
+	var url string
+	for _, src := range stream.Sources() {
+		if strings.HasPrefix(src, "rtsp://") || strings.HasPrefix(src, "rtsps://") {
+			url = src
+			break
+		}
+	}
+	if url == "" {
+		return nil
+	}
+
+	conn := rtsp.NewClient(url)
+	conn.Backchannel = true
+
+	log := app.GetLogger("sip")
+	if err := conn.Dial(); err != nil {
+		log.Warn().Err(err).Str("url", url).Msg("[sip] backchannel dial failed")
+		return nil
+	}
+	if err := conn.Describe(); err != nil {
+		log.Warn().Err(err).Str("url", url).Msg("[sip] backchannel describe failed")
+		_ = conn.Close()
+		return nil
+	}
+
+	var media *core.Media
+	var codec *core.Codec
+	for _, m := range conn.GetMedias() {
+		if m.Kind != core.KindAudio || m.Direction != core.DirectionSendonly {
+			continue
+		}
+		media = m
+		for _, cd := range m.Codecs {
+			if cd.Name == core.CodecPCMA && cd.ClockRate == 8000 {
+				codec = cd
+				break
+			}
+		}
+		if codec == nil {
+			codec = m.Codecs[0]
+		}
+		break
+	}
+	if media == nil || codec == nil {
+		log.Warn().Str("url", url).Msg("[sip] no usable backchannel audio")
+		_ = conn.Close()
+		return nil
+	}
+
+	// Keep the send session alive. With no receivers, Handle() blocks reading
+	// (keepalive) while the conn stays in PLAY — the persistent backchannel.
+	go conn.Start()
+
+	c.back = &backchannel{conn: conn, media: media, codec: codec}
+	return c.back
+}
+
+// mergeCodecs appends any codecs not already present from src into into.
+func mergeCodecs(src *core.Media, into *[]*core.Codec) {
+	if src == nil {
+		return
+	}
+	seen := make(map[string]bool, len(*into))
+	for _, cd := range *into {
+		seen[mergeKey(cd)] = true
+	}
+	for _, cd := range src.Codecs {
+		if !seen[mergeKey(cd)] {
+			seen[mergeKey(cd)] = true
+			*into = append(*into, cd)
+		}
+	}
+}
+
+func mergeKey(cd *core.Codec) string {
+	return cd.Name + "/" + strconv.Itoa(cd.ClockRate)
+}
+
 func (c *consumer) onInvite(conn *net.UDPConn, ra *net.UDPAddr, msg string) {
 	log := app.GetLogger("sip")
 	callID := getHdr(msg, "Call-ID")
@@ -290,6 +395,14 @@ func (c *consumer) onInvite(conn *net.UDPConn, ra *net.UDPAddr, msg string) {
 		log.Warn().Str("call_id", callID).Msg("[sip] no audio producers on stream")
 		reject(conn, ra, msg, callID, 488, "No Compatible Audio")
 		return
+	}
+
+	// Backchannel runs on a dedicated persistent rtsp connection; the watch conn
+	// used for main audio can't carry RTP to the camera. Offer the backchannel
+	// codecs that dedicated conn negotiated so the caller gets a return path.
+	back := c.ensureBackchannel(stream)
+	if back != nil {
+		mergeCodecs(back.media, &audioSendonly)
 	}
 
 	// Negotiate the best audio codec that both camera and caller support.
@@ -399,6 +512,16 @@ func (c *consumer) onInvite(conn *net.UDPConn, ra *net.UDPAddr, msg string) {
 			c.sessionsMu.Unlock()
 			rtpEp.Stop()
 			return
+		}
+	}
+
+	// Drive the caller→camera backchannel into the persistent rtsp connection.
+	if back != nil && direction != core.DirectionRecvonly {
+		rx := rtpEp.BackchannelReceiver(back.media, back.codec)
+		if err := back.conn.AddTrack(back.media, back.codec, rx); err != nil {
+			log.Warn().Err(err).Str("call_id", callID).Msg("[sip] backchannel attach failed")
+		} else {
+			log.Info().Str("call_id", callID).Msg("[sip] backchannel attached")
 		}
 	}
 
