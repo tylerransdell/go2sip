@@ -295,7 +295,10 @@ func (c *consumer) ensureBackchannel(stream *streams.Stream, recvonlyCodecs []*c
 		recvNames[mergeKey(cd)] = true
 	}
 
-	// rtsp targets: dedicated RECORD (publish) backchannel conn.
+	// rtsp targets: preferred dedicated RECORD (publish) conn. If it can't be
+	// established (e.g. the camera rejects a second backchannel Require session
+	// and its non-Require DESCRIBE omits the sendonly media), fall back to the
+	// Option-A watch-conn track below, which works (pushes caller audio).
 	var url string
 	for _, src := range stream.Sources() {
 		if strings.HasPrefix(src, "rtsp://") || strings.HasPrefix(src, "rtsps://") {
@@ -304,8 +307,10 @@ func (c *consumer) ensureBackchannel(stream *streams.Stream, recvonlyCodecs []*c
 		}
 	}
 	if url != "" {
-		c.back = openRTSPBackchannel(url, recvNames)
-		return c.back
+		if bc := openRTSPBackchannel(url, recvNames); bc != nil {
+			c.back = bc
+			return c.back
+		}
 	}
 
 	var media *core.Media
