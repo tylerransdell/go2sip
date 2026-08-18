@@ -455,13 +455,10 @@ func (c *consumer) onInvite(conn *net.UDPConn, ra *net.UDPAddr, msg string) {
 		return
 	}
 
-	// Backchannel runs on a dedicated persistent rtsp connection; the watch conn
-	// used for main audio can't carry RTP to the camera. Offer the backchannel
-	// codecs that dedicated conn negotiated so the caller gets a return path.
+	// Persistent backchannel owner on the watch conn (option A). back.codec is the
+	// single codec we'll drive toward the camera, chosen to match its recvonly
+	// main codec (PCMA/8000).
 	back := c.ensureBackchannel(stream, audioRecvonly)
-	if back != nil {
-		mergeCodecs(back.media, &audioSendonly)
-	}
 
 	// Negotiate the best audio codec that both camera and caller support.
 	commonCodec := negotiateAudio(audioRecvonly, offerSDP)
@@ -486,29 +483,46 @@ func (c *consumer) onInvite(conn *net.UDPConn, ra *net.UDPAddr, msg string) {
 		sdpCodecs = append(sdpCodecs, commonCodec)
 	}
 
-	// Add backchannel codecs that differ from the common codec.
-	for _, bc := range audioSendonly {
-		if sipCodecPriority(bc.Name) == 0 {
-			continue
-		}
-		already := false
+	// Add backchannel to the answer as the SINGLE codec we will actually drive
+	// (back.codec, chosen to match the camera's recvonly main codec — PCMA/8000).
+	// Keeping both directions on one codec gives a clean sendrecv m-line, which
+	// SIP callers send audio back on (a many-codec recvonly fan-out does not).
+	if back != nil && sipCodecPriority(back.codec.Name) != 0 {
+		dup := false
 		for _, c := range sdpCodecs {
-			if c.Name == bc.Name {
-				already = true
+			if mergeKey(c) == mergeKey(back.codec) {
+				dup = true
 				break
 			}
 		}
-		if !already {
-			c := &core.Codec{
-				Name:        bc.Name,
-				ClockRate:   codecClockRate(bc.Name),
-				Channels:    codecChannels(bc.Name),
-				PayloadType: codecPT(bc.Name),
+		if !dup {
+			sdpCodecs = append(sdpCodecs, back.codec)
+		}
+	} else {
+		// Fallback: advertise backchannel codecs that differ from the main one.
+		for _, bc := range audioSendonly {
+			if sipCodecPriority(bc.Name) == 0 {
+				continue
 			}
-			if bc.FmtpLine != "" {
-				c.FmtpLine = bc.FmtpLine
+			already := false
+			for _, c := range sdpCodecs {
+				if c.Name == bc.Name {
+					already = true
+					break
+				}
 			}
-			sdpCodecs = append(sdpCodecs, c)
+			if !already {
+				c := &core.Codec{
+					Name:        bc.Name,
+					ClockRate:   codecClockRate(bc.Name),
+					Channels:    codecChannels(bc.Name),
+					PayloadType: codecPT(bc.Name),
+				}
+				if bc.FmtpLine != "" {
+					c.FmtpLine = bc.FmtpLine
+				}
+				sdpCodecs = append(sdpCodecs, c)
+			}
 		}
 	}
 
