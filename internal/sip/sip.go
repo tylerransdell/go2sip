@@ -286,7 +286,7 @@ func (c *consumer) ensureBackchannel(stream *streams.Stream, recvonlyCodecs []*c
 
 	recvNames := make(map[string]bool, len(recvonlyCodecs))
 	for _, cd := range recvonlyCodecs {
-		recvNames[cd.Name] = true
+		recvNames[mergeKey(cd)] = true
 	}
 
 	var media *core.Media
@@ -331,20 +331,29 @@ func (c *consumer) ensureBackchannel(stream *streams.Stream, recvonlyCodecs []*c
 
 // pickBackchannelCodec chooses which codec to send back to the camera on its
 // backchannel, in priority order:
-//  1. whatever codec the camera already sends us recvonly (main audio) — the
-//     "explicit" PR's preferred pick so the two legs agree,
-//  2. PCMA (alaw),
+//  1. the exact codec (name AND sample rate/channels) the camera already sends
+//     us recvonly (main audio) — the "explicit" PR's preferred pick,
+//  2. PCMA (alaw), preferring 8000 Hz,
 //  3. the first codec on the camera's backchannel list (handled by the caller).
 func pickBackchannelCodec(codecs []*core.Codec, recvOnly map[string]bool) *core.Codec {
 	for _, cd := range codecs {
-		if recvOnly[cd.Name] {
+		if recvOnly[mergeKey(cd)] {
 			return cd
 		}
 	}
+	var pcma *core.Codec
 	for _, cd := range codecs {
 		if cd.Name == core.CodecPCMA {
-			return cd
+			if cd.ClockRate == 8000 {
+				return cd
+			}
+			if pcma == nil {
+				pcma = cd
+			}
 		}
+	}
+	if pcma != nil {
+		return pcma
 	}
 	return nil
 }
