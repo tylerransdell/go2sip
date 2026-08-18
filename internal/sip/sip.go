@@ -286,6 +286,15 @@ func (c *consumer) ensureBackchannel(stream *streams.Stream, recvonlyCodecs []*c
 		return c.back
 	}
 
+	// Intentionally disabled: opening a second rtsp connection to the camera
+	// disrupts the main rtsp session (single-session cameras reject it and the
+	// main stream reconnects). We must keep the rtsp stream + preload + gop cache
+	// working, so backchannel stays on the SAME rtsp conn via the native pool
+	// (the rtp endpoint advertises its recvonly media and the pool pairs it),
+	// exactly like tapo. Leave everything below intact for when a camne allows a
+	// dedicated backchannel into the camera.
+	return nil
+
 	var url string
 	for _, src := range stream.Sources() {
 		if strings.HasPrefix(src, "rtsp://") || strings.HasPrefix(src, "rtsps://") {
