@@ -162,6 +162,40 @@ func (c *consumer) run() {
 
 	go c.listen(c.cfg.Port)
 	go c.cleanupLoop()
+	go c.warmBackchannel()
+}
+
+// warmBackchannel brings up the dedicated rtsp backchannel connection as soon as
+// the configured stream exists, and keeps it. This is the "preload picks up the
+// backchannel" step: it gives us a persistent, warm send path to attach a call's
+// (caller→camera) receiver to without re-dialing or tearing the camera channel.
+// Retries briefly in case the stream (and its producer URLs) aren't up yet.
+func (c *consumer) warmBackchannel() {
+	for i := 0; i < 60; i++ {
+		stream := streams.Get(c.cfg.Stream)
+		if stream != nil && len(stream.Producers()) > 0 {
+			var recv []*core.Codec
+			for _, prod := range stream.Producers() {
+				if prod == nil {
+					continue
+				}
+				for _, m := range prod.GetMedias() {
+					if m.Kind != core.KindAudio || m.Direction != core.DirectionRecvonly {
+						continue
+					}
+					recv = append(recv, m.Codecs...)
+				}
+			}
+			if len(recv) > 0 {
+				if c.ensureBackchannel(stream, recv) != nil {
+					log := app.GetLogger("sip")
+					log.Info().Str("stream", c.cfg.Stream).Msg("[sip] backchannel preloaded")
+				}
+			}
+			return
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 // cleanupLoop reaps sessions with no RTP/RTCP activity for over 1 minute.
