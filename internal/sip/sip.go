@@ -345,7 +345,7 @@ func mergeCodecs(src *core.Media, into *[]*core.Codec) {
 }
 
 func mergeKey(cd *core.Codec) string {
-	return cd.Name + "/" + strconv.Itoa(cd.ClockRate)
+	return cd.Name + "/" + strconv.Itoa(int(cd.ClockRate))
 }
 
 func (c *consumer) onInvite(conn *net.UDPConn, ra *net.UDPAddr, msg string) {
