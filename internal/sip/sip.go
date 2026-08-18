@@ -13,6 +13,7 @@ import (
 	"github.com/AlexxIT/go2rtc/internal/streams"
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/AlexxIT/go2rtc/pkg/rtp"
+	"github.com/AlexxIT/go2rtc/pkg/rtsp"
 	"github.com/pion/sdp/v3"
 )
 
@@ -100,11 +101,13 @@ type consumer struct {
 	back   *backchannel
 }
 
-// backchannel is the persistent backchannel owner (Option A): a single sendable
-// backchannel track created once on the preload-owned watch conn. Calls route
-// their caller→camera audio into it; no new sender is created per call and
-// nothing is attached/unlinked on teardown (preload/GOP stay untouched).
+// backchannel is the persistent backchannel owner. For rtsp targets it is a
+// dedicated RTSP connection driven to RECORD (publish-to-camera); for non-rtsp
+// (tapo) it is a single sendable backchannel track on the watch conn. Calls
+// route caller→camera audio into track; no new sender is created per call and
+// nothing is attached/unlinked on teardown. Preload/GOP continue untouched.
 type backchannel struct {
+	conn  *rtsp.Conn
 	track *core.Receiver
 	media *core.Media
 	codec *core.Codec
@@ -271,10 +274,11 @@ func (c *consumer) updateActivityForIP(ip string) {
 	}
 }
 
-// ensureBackchannel creates (once) the persistent backchannel owner on the
-// stream's own watch conn (Option A): it binds a single sendable backchannel
-// track on the producer, so calls never spawn a new sender and nothing is
-// attached/unlinked per call.
+// ensureBackchannel creates (once) the persistent backchannel owner.
+// For rtsp targets it opens a dedicated, kept-alive RTSP connection driven to
+// RECORD (publish-to-camera); for others (tapo) it binds a single sendable
+// backchannel track on the watch conn. No new sender per call, nothing
+// attached/unlinked on teardown.
 //
 // recvonlyCodecs are the audio codecs the camera sends us on its recvonly (main)
 // side; they bias the codec pick to stay in line with the "explicit" PR: prefer
@@ -289,6 +293,19 @@ func (c *consumer) ensureBackchannel(stream *streams.Stream, recvonlyCodecs []*c
 	recvNames := make(map[string]bool, len(recvonlyCodecs))
 	for _, cd := range recvonlyCodecs {
 		recvNames[mergeKey(cd)] = true
+	}
+
+	// rtsp targets: dedicated RECORD (publish) backchannel conn.
+	var url string
+	for _, src := range stream.Sources() {
+		if strings.HasPrefix(src, "rtsp://") || strings.HasPrefix(src, "rtsps://") {
+			url = src
+			break
+		}
+	}
+	if url != "" {
+		c.back = openRTSPBackchannel(url, recvNames)
+		return c.back
 	}
 
 	var media *core.Media
@@ -319,7 +336,7 @@ func (c *consumer) ensureBackchannel(stream *streams.Stream, recvonlyCodecs []*c
 		return nil
 	}
 
-	// Bind the single persistent backchannel track on the watch conn, once.
+	// Non-rtsp (tapo): single persistent backchannel track on the watch conn.
 	track := core.NewReceiver(media, codec)
 	if err := target.AddTrack(media, codec, track); err != nil {
 		log := app.GetLogger("sip")
@@ -329,6 +346,72 @@ func (c *consumer) ensureBackchannel(stream *streams.Stream, recvonlyCodecs []*c
 
 	c.back = &backchannel{track: track, media: media, codec: codec}
 	return c.back
+}
+
+// openRTSPBackchannel opens a dedicated rtsp connection kept alive for the
+// backchannel and drives it to RECORD (client → camera). RECORD is used rather
+// than PLAY: PLAY is receive, and a send track stuck in PLAY is never drained by
+// the camera (which is what produced the drops). Preload/GOP watch conn is not
+// touched.
+func openRTSPBackchannel(url string, recvNames map[string]bool) *backchannel {
+	conn := rtsp.NewClient(url)
+	conn.UserAgent = app.UserAgent
+	conn.Backchannel = true
+
+	log := app.GetLogger("sip")
+	if err := conn.Dial(); err != nil {
+		log.Warn().Err(err).Str("url", url).Msg("[sip] backchannel dial failed")
+		return nil
+	}
+	if err := conn.Describe(); err != nil {
+		if !conn.Backchannel {
+			log.Warn().Err(err).Str("url", url).Msg("[sip] backchannel describe failed")
+			return nil
+		}
+		// Describe refused with the ONVIF backchannel Require; retry without it.
+		conn.Backchannel = false
+		if err := conn.Dial(); err != nil {
+			log.Warn().Err(err).Str("url", url).Msg("[sip] backchannel redial failed")
+			return nil
+		}
+		if err := conn.Describe(); err != nil {
+			log.Warn().Err(err).Str("url", url).Msg("[sip] backchannel describe failed")
+			return nil
+		}
+	}
+
+	var media *core.Media
+	var codec *core.Codec
+	for _, m := range conn.GetMedias() {
+		if m.Kind != core.KindAudio ||
+			(m.Direction != core.DirectionSendonly && m.Direction != core.DirectionSendRecv) {
+			continue
+		}
+		media = m
+		codec = pickBackchannelCodec(m.Codecs, recvNames)
+		if codec == nil && len(m.Codecs) > 0 {
+			codec = m.Codecs[0]
+		}
+		break
+	}
+	if media == nil || codec == nil {
+		log.Warn().Str("url", url).Msg("[sip] no usable rtsp backchannel audio")
+		return nil
+	}
+
+	// Bind a receiver (SETUP via conn.AddTrack) then RECORD so the camera starts
+	// consuming the pushed RTP. The conn is held for the lifetime of the owner.
+	track := core.NewReceiver(media, codec)
+	if err := conn.AddTrack(media, codec, track); err != nil {
+		log.Warn().Err(err).Str("url", url).Msg("[sip] backchannel setup failed")
+		return nil
+	}
+	if err := conn.Record(); err != nil {
+		log.Warn().Err(err).Str("url", url).Msg("[sip] backchannel record failed")
+		return nil
+	}
+
+	return &backchannel{conn: conn, track: track, media: media, codec: codec}
 }
 
 // pickBackchannelCodec chooses which codec to send back to the camera on its
