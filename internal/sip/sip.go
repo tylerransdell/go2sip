@@ -298,11 +298,14 @@ func (c *consumer) ensureBackchannel(stream *streams.Stream, recvonlyCodecs []*c
 	}
 
 	conn := rtsp.NewClient(url)
-	// Do NOT set Backchannel=true: that adds `Require: onvif backchannel` to
-	// DESCRIBE which many cameras reject ("wrong response on DESCRIBE"). The
-	// camera still advertises its sendonly backchannel m-line in a plain DESCRIBE;
-	// we keep that media here and use AddTrack + Start for the actual send path.
-	conn.Backchannel = false
+	conn.UserAgent = app.UserAgent
+
+	// Mirror internal/rtsp.rtspHandler dialing that produces the working watch
+	// conn: describe with the ONVIF backchannel Require first; if the camera
+	// rejects it, dial again without and describe again. Some cameras only
+	// advertise the sendonly (backchannel) m-line in one of these modes, and
+	// several (Dahua) vary the response by User-Agent.
+	conn.Backchannel = true
 
 	log := app.GetLogger("sip")
 	if err := conn.Dial(); err != nil {
@@ -310,9 +313,23 @@ func (c *consumer) ensureBackchannel(stream *streams.Stream, recvonlyCodecs []*c
 		return nil
 	}
 	if err := conn.Describe(); err != nil {
-		log.Warn().Err(err).Str("url", url).Msg("[sip] backchannel describe failed")
-		_ = conn.Close()
-		return nil
+		if !conn.Backchannel {
+			log.Warn().Err(err).Str("url", url).Msg("[sip] backchannel describe failed")
+			_ = conn.Close()
+			return nil
+		}
+		// second try without the Require header
+		conn.Backchannel = false
+		if err := conn.Dial(); err != nil {
+			log.Warn().Err(err).Str("url", url).Msg("[sip] backchannel redial failed")
+			_ = conn.Close()
+			return nil
+		}
+		if err := conn.Describe(); err != nil {
+			log.Warn().Err(err).Str("url", url).Msg("[sip] backchannel describe failed")
+			_ = conn.Close()
+			return nil
+		}
 	}
 
 	recvNames := make(map[string]bool, len(recvonlyCodecs))
@@ -323,7 +340,8 @@ func (c *consumer) ensureBackchannel(stream *streams.Stream, recvonlyCodecs []*c
 	var media *core.Media
 	var codec *core.Codec
 	for _, m := range conn.GetMedias() {
-		if m.Kind != core.KindAudio || m.Direction != core.DirectionSendonly {
+		if m.Kind != core.KindAudio ||
+			(m.Direction != core.DirectionSendonly && m.Direction != core.DirectionSendRecv) {
 			continue
 		}
 		media = m
@@ -334,6 +352,11 @@ func (c *consumer) ensureBackchannel(stream *streams.Stream, recvonlyCodecs []*c
 		break
 	}
 	if media == nil || codec == nil {
+		for _, m := range conn.GetMedias() {
+			log.Debug().Str("kind", string(m.Kind)).
+				Str("dir", m.Direction).Int("codecs", len(m.Codecs)).
+				Msg("[sip] backchannel media seen")
+		}
 		log.Warn().Str("url", url).Msg("[sip] no usable backchannel audio")
 		_ = conn.Close()
 		return nil
