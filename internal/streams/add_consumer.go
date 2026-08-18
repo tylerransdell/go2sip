@@ -50,6 +50,18 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 					continue
 				}
 
+				// Backchannel (producer sendonly): if the producer also advertises
+				// the recvonly codec it is sending us (the "apples" it deals in) on
+				// its sendonly/backchannel list, that codec is a hard pick for the
+				// backchannel — don't let the matcher choose another codec at will.
+				// Only fall back to the default match when the recvonly codec isn't
+				// on the backchannel list (or the consumer can't send it).
+				if prodMedia.Direction == core.DirectionSendonly {
+					if pc, cc := matchPreferredBackchannel(prod, prodMedia, consMedia); pc != nil {
+						prodCodec, consCodec = pc, cc
+					}
+				}
+
 				var track *core.Receiver
 
 				switch prodMedia.Direction {
@@ -163,4 +175,31 @@ func appendString(s, elem string) string {
 		return elem
 	}
 	return s + ", " + elem
+}
+
+// matchPreferredBackchannel returns the codec pair (producer backchannel codec,
+// consumer backchannel codec) for a sendonly/backchannel producer media, biased
+// toward the codec the producer is already sending us on its recvonly side.
+//
+// Rule: if a codec on the producer's recvonly medias (what it sends us, "apples")
+// also appears on its sendonly/backchannel list and is supported by the consumer's
+// recvonly medias, that codec is the hard choice for the backchannel — never an
+// arbitrary first match. Returns nil when no such shared codec exists so the
+// caller keeps its default MatchMedia result (nothing is forced).
+func matchPreferredBackchannel(prod *Producer, sendonly, consMedia *core.Media) (*core.Codec, *core.Codec) {
+	for _, media := range prod.GetMedias() {
+		if media.Kind != consMedia.Kind || media.Direction != core.DirectionRecvonly {
+			continue
+		}
+		for _, recvCodec := range media.Codecs {
+			// the codec we receive must also be acceptable to send back on the
+			// backchannel list and supported by the consumer (caller)
+			pc := sendonly.MatchCodec(recvCodec)
+			cc := consMedia.MatchCodec(recvCodec)
+			if pc != nil && cc != nil {
+				return pc, cc
+			}
+		}
+	}
+	return nil, nil
 }
