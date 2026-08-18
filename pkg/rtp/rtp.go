@@ -148,6 +148,25 @@ func (r *RTP) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, er
 	return r.receiver, nil
 }
 
+// BackchannelReceiver returns the shared backchannel (caller→camera) receiver,
+// creating and registering it lazily the first time it is requested. It mirrors
+// GetTrack but is meant to be called directly by the SIP module so the receiver
+// can be wired into a dedicated rtsp backchannel connection (instead of relying
+// on the stream matcher — which would attach it to a watch conn that can't send).
+func (r *RTP) BackchannelReceiver(media *core.Media, codec *core.Codec) *core.Receiver {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.receiver != nil {
+		return r.receiver
+	}
+
+	r.receiver = core.NewReceiver(media, codec)
+	r.Receivers = append(r.Receivers, r.receiver)
+
+	return r.receiver
+}
+
 func (r *RTP) Start() error {
 	return nil
 }

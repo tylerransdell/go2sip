@@ -208,6 +208,23 @@ func (c *Conn) Describe() error {
 		medias = clone
 	}
 
+	// A watch (non-backchannel) conn can only receive. It cannot push RTP out
+	// to the camera, so drop any sendonly (backchannel) media it would otherwise
+	// advertise — attaching a backchannel receiver to it produces a sender that
+	// can't transmit a single byte and leaves a stale node on the long-lived
+	// conn. Dedicated backchannel conns (c.Backchannel == true) keep them so a
+	// real send path can be driven from the camera's advertised backchannel.
+	if !c.Backchannel {
+		keep := medias[:0]
+		for _, m := range medias {
+			if m.Direction == core.DirectionSendonly {
+				continue
+			}
+			keep = append(keep, m)
+		}
+		medias = keep
+	}
+
 	// TODO: rewrite more smart
 	if c.Medias == nil {
 		c.Medias = medias
