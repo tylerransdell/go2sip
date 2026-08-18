@@ -238,7 +238,12 @@ func (c *consumer) updateActivityForIP(ip string) {
 // connection to the camera. The watch conn used for main audio cannot push RTP
 // out to the camera, so the caller→camera path must live on this separate
 // active-producer connection, held across calls (persistent / low-latency).
-func (c *consumer) ensureBackchannel(stream *streams.Stream) *backchannel {
+//
+// recvonlyCodecs are the audio codecs the camera sends us on its recvonly (main)
+// side, used to bias the backchannel codec pick to stay in line with the
+// "explicit" PR: prefer the codec the camera already deals in, then PCMA, then
+// the first listed.
+func (c *consumer) ensureBackchannel(stream *streams.Stream, recvonlyCodecs []*core.Codec) *backchannel {
 	c.backMu.Lock()
 	defer c.backMu.Unlock()
 	if c.back != nil {
@@ -270,6 +275,11 @@ func (c *consumer) ensureBackchannel(stream *streams.Stream) *backchannel {
 		return nil
 	}
 
+	recvNames := make(map[string]bool, len(recvonlyCodecs))
+	for _, cd := range recvonlyCodecs {
+		recvNames[cd.Name] = true
+	}
+
 	var media *core.Media
 	var codec *core.Codec
 	for _, m := range conn.GetMedias() {
@@ -277,12 +287,7 @@ func (c *consumer) ensureBackchannel(stream *streams.Stream) *backchannel {
 			continue
 		}
 		media = m
-		for _, cd := range m.Codecs {
-			if cd.Name == core.CodecPCMA && cd.ClockRate == 8000 {
-				codec = cd
-				break
-			}
-		}
+		codec = pickBackchannelCodec(m.Codecs, recvNames)
 		if codec == nil {
 			codec = m.Codecs[0]
 		}
@@ -300,6 +305,26 @@ func (c *consumer) ensureBackchannel(stream *streams.Stream) *backchannel {
 
 	c.back = &backchannel{conn: conn, media: media, codec: codec}
 	return c.back
+}
+
+// pickBackchannelCodec chooses which codec to send back to the camera on its
+// backchannel, in priority order:
+//  1. whatever codec the camera already sends us recvonly (main audio) — the
+//     "explicit" PR's preferred pick so the two legs agree,
+//  2. PCMA (alaw),
+//  3. the first codec on the camera's backchannel list (handled by the caller).
+func pickBackchannelCodec(codecs []*core.Codec, recvOnly map[string]bool) *core.Codec {
+	for _, cd := range codecs {
+		if recvOnly[cd.Name] {
+			return cd
+		}
+	}
+	for _, cd := range codecs {
+		if cd.Name == core.CodecPCMA {
+			return cd
+		}
+	}
+	return nil
 }
 
 // mergeCodecs appends any codecs not already present from src into into.
@@ -400,7 +425,7 @@ func (c *consumer) onInvite(conn *net.UDPConn, ra *net.UDPAddr, msg string) {
 	// Backchannel runs on a dedicated persistent rtsp connection; the watch conn
 	// used for main audio can't carry RTP to the camera. Offer the backchannel
 	// codecs that dedicated conn negotiated so the caller gets a return path.
-	back := c.ensureBackchannel(stream)
+	back := c.ensureBackchannel(stream, audioRecvonly)
 	if back != nil {
 		mergeCodecs(back.media, &audioSendonly)
 	}
